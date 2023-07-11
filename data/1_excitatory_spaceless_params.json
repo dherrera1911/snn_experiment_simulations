@@ -1,0 +1,1 @@
+{"nTrials": 1, "simTime": 800.0, "recordDelay": 300.0, "nColumns": 37, "nRows": 37, "distMask": 0.15, "wSpaceStd": 0.12, "wSyn": 40, "pConn": 0.2, "noiseStrength": 100, "noiseRate": 30, "stimCurrent": 600.0, "neuronType": "aeif_cond_alpha", "t_ref": 20.0, "V_reset": -70, "I_e": 130.0, "g_L": 30.0}
