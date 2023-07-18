@@ -14,16 +14,20 @@ import nest
 import nest.voltage_trace
 import matplotlib.pyplot as plt
 import json
+import time
 
 
+start = time.time()
+saveDataDir = './data/'
 #############
 # Simulation parameters
 #############
 
-plotOrSave = 'plot' # 'plot' or 'save' the results
+plotOrSave = 'save' # 'plot' or 'save' the results
+nThreads = 4
 
 # Experiment parameters
-nTrials = 1
+nTrials = 1000
 simTime = 800.0  # Total simulation time in ms
 recordDelay = 300.0
 
@@ -38,7 +42,7 @@ wSyn = 60
 wSpaceStd = 0.12
 
 # Noisy drive parameters
-noiseStrength = 130 
+noiseStrength = 130
 noiseRate = 30  # Rate of poisson noise generators
 
 # Stimulation drive
@@ -77,7 +81,8 @@ for trial in range(nTrials):
         # Set random seed at constant value to have same connectivity always
         #############
         nest.SetKernelStatus({'rng_seed': 1911,
-                              'update_time_limit': 1.0})
+                              'update_time_limit': 1.0,
+                              'local_num_threads': nThreads})
 
         #############
         # Create neurons
@@ -227,17 +232,20 @@ paramDict = {'nTrials': nTrials,
              'g_L': g_L}
 
 
+end = time.time()
+print(f'Time elapsed: {end-start}')
+
 #############
 # Plot
 #############
 
 if plotOrSave == 'save':
+    os.makedirs(saveDataDir, exist_ok=True)
     # Save param dict
-    with open('../data/3_excitatory_spatial_params.json', 'w') as fp:
+    with open(f'{saveDataDir}3_excitatory_spatial_params.json', 'w') as fp:
         json.dump(paramDict, fp)
-
     # Save the dataframe
-    experimentDf.to_csv('../data/3_excitatory_spatial.csv', index=False)
+    experimentDf.to_csv(f'{saveDataDir}3_excitatory_spatial.csv', index=False)
 
 elif plotOrSave == 'plot':
 
@@ -267,4 +275,5 @@ elif plotOrSave == 'plot':
     directConnBool = trialDf['DirectConn'] == 1
     print(f"Total mean: {np.mean(trialDf['Activation'])}")
     print(f"Direct: {np.mean(trialDf['Activation'][directConnBool])}")
+
 

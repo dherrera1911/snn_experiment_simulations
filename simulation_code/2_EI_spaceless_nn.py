@@ -14,17 +14,22 @@ import nest
 import nest.voltage_trace
 import matplotlib.pyplot as plt
 import auxiliary_functions as af
+import json
+import time
+import os
 
 
+start = time.time()
+saveDataDir = './data/'
 #############
 # Simulation parameters
 #############
 
-plotOrSave = 'plot' # 'plot' or 'save' the results
+plotOrSave = 'save'  # 'plot' or 'save' the results
+nThreads = 4
 
 # Experiment parameters
-nTrials = 500
-nTrials = 1
+nTrials = 1000
 simTime = 800.0  # Total simulation time in ms
 recordDelay = 300.0
 
@@ -95,7 +100,9 @@ for trial in range(nTrials):
         #############
         # Set random seed at constant value to have same connectivity always
         #############
-        nest.SetKernelStatus({'rng_seed': 1911})
+        nest.SetKernelStatus({'rng_seed': 1911,
+                              'update_time_limit': 1.0,
+                              'local_num_threads': nThreads})
 
         #############
         # Create neurons
@@ -162,7 +169,7 @@ for trial in range(nTrials):
         # Run the simulation
         #############
         # Change seed to random seed, so that each trial is different
-        nest.SetKernelStatus({'rng_seed': np.random.randint(low=1, high=100000)})
+        nest.SetKernelStatus({'rng_seed': np.random.randint(low=1, high=1000000)})
         # Set up and run simulation
         nest.Simulate(simTime)
 
@@ -247,13 +254,12 @@ paramDict = {'nTrials': nTrials,
              'g_L': g_L}
 
 if plotOrSave == 'save':
+    os.makedirs(saveDataDir, exist_ok=True)
     # Save param dict
-    with open('./simulation_data/2_EI_spaceless_params.json', 'w') as fp:
+    with open(f'{saveDataDir}2_EI_spaceless_params.json', 'w') as fp:
         json.dump(paramDict, fp)
-
     # Save the dataframe
-    #experimentDf.to_csv('./simulation_data/1_excitatory_spaceless.csv', index=False)
-    experimentDf.to_csv('../data/2_EI_spaceless.csv', index=False)
+    experimentDf.to_csv(f'{saveDataDir}2_EI_spaceless.csv', index=False)
 
 elif plotOrSave == 'plot':
     #############

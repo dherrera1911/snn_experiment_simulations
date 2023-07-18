@@ -13,17 +13,22 @@ import pandas as pd
 import nest
 import nest.voltage_trace
 import matplotlib.pyplot as plt
+import auxiliary_functions as af
 import json
+import time
+import os
 
-
+start = time.time()
+saveDataDir = './data/'
 #############
 # Simulation parameters
 #############
 
-plotOrSave = 'save' # 'plot' or 'save' the results
+plotOrSave = 'save'  # 'plot' or 'save' the results
+nThreads = 4
 
 # Experiment parameters
-nTrials = 500
+nTrials = 1000
 simTime = 800.0  # Total simulation time in ms
 recordDelay = 300.0
 
@@ -73,8 +78,8 @@ for trial in range(nTrials):
         # Set random seed at constant value to have same connectivity always
         #############
         nest.SetKernelStatus({'rng_seed': 1911,
-                              'update_time_limit': 1.0})
-
+                              'update_time_limit': 1.0,
+                              'local_num_threads': nThreads})
         #############
         # Create neurons
         #############
@@ -130,7 +135,7 @@ for trial in range(nTrials):
         # Simulate
         #############
         # Change seed to random seed, so that each trial is different
-        nest.SetKernelStatus({'rng_seed': np.random.randint(low=1, high=100000)})
+        nest.SetKernelStatus({'rng_seed': np.random.randint(low=1, high=1000000)})
         # Simulate
         nest.Simulate(simTime)
 
@@ -204,11 +209,13 @@ paramDict = {'nTrials': nTrials,
              'g_L': g_L}
 
 if plotOrSave == 'save':
+    os.makedirs(saveDataDir, exist_ok=True)
     # Save param dict
-    with open('../data/1_excitatory_spaceless_params.json', 'w') as fp:
+    with open(f'{saveDataDir}1_excitatory_spaceless_params.json', 'w') as fp:
         json.dump(paramDict, fp)
     # Save the dataframe
-    experimentDf.to_csv('../data/1_excitatory_spaceless.csv', index=False)
+    experimentDf.to_csv(f'{saveDataDir}1_excitatory_spaceless.csv', index=False)
+
 elif plotOrSave == 'plot':
     #############
     # Plot
@@ -239,4 +246,8 @@ elif plotOrSave == 'plot':
     print(f"Direct: {np.mean(trialDf['Activation'][directConnBool])}")
     print(f"InNet: {np.mean(trialDf['Activation'][samePopBool])}")
     print(f"OutNet: {np.mean(trialDf['Activation'][diffPopBool])}")
+
+end = time.time()
+print(f'Time elapsed: {end-start}')
+
 
