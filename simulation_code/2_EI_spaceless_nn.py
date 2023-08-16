@@ -30,7 +30,7 @@ nThreads = 4
 
 # Experiment parameters
 nTrials = 1000
-simTime = 800.0  # Total simulation time in ms
+simTime = 1800.0  # Total simulation time in ms
 recordDelay = 300.0
 
 # Population size
