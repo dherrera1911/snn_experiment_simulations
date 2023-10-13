@@ -2,48 +2,57 @@
 # 
 # Basic test of Stan models for spaceless data.
 # To test the model fits, we generate data from a simple
-# generative model and fit it with the model.
+# generative model and analyze it with the model and with
+# simpler methods.
 # 
 ##################################################
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import stan
-import matplotlib.pyplot as plt
+import plotnine as pn
+from cmdstanpy import CmdStanModel
 import seaborn as sns
 import os
+import arviz as az
+import scipy.stats as stats
+from sklearn.metrics import roc_curve
+from functions_analysis import *
+
 
 ###############
 # 1) GENERATE THE DATA
 ###############
 
 # Dataset parameters
-nTrials = 50  # number of trials per condition
-neuronsConnN = 30  # number of neurons connected to the target
-neuronsNetN = 100  # number of neurons in the network with target
-neuronsOutNetN = 50  # number of neurons outside of the target's network
-baselineFiring = 10  # mean baseline firing rate
+nTrials = 15  # number of trials per condition
+neurons1N = 50  # number of neurons with effect (population 1)
+neurons2N = 100  # number of neuronsw without effect (population 2)
+baselineFiring = 14  # mean baseline firing rate
 neuronBaselineSd = 3  # variability in baseline firing rate
-connEffect = 0.5  # mean effect of stimulation on FR of connected neuron
-netEffect = 0.1  # mean effect of stimulation on FR of in-network neuron
+effect = 2  # mean effect of stimulation on population 1
+effectSd = 0.8  # variability in effect of stimulation
 residualSd = 3  # trial response variability
 
-nNeurons = neuronsConnN + neuronsNetN + neuronsOutNetN
-neuronType = ['C'] * neuronsConnN + ['N'] * neuronsNetN + \
-  ['O'] * neuronsOutNetN
-typeEffects = {'C': connEffect, 'N': netEffect, 'O': 0}
-
-# Define the means for each condition and group
-neuronBaselines = np.random.normal(0, neuronBaselineSd, nNeurons) + \
-  baselineFiring
+nNeurons = neurons1N + neurons2N
+neuronType = np.array([0] * neurons1N + [1] * neurons2N)
+typeEffects = [effect, 0]
 
 # Generate the dataset
 data = []
+# Generate the baseline firing rates for each neuron
+neuronBaselines = np.random.normal(0, neuronBaselineSd, nNeurons) + \
+  baselineFiring
+# Define the means for each condition and group
+nrnEffect = np.zeros(nNeurons)
 for neuron in range(nNeurons):
+    if neuronType[neuron] == 0:
+        nrnEffect[neuron] = np.max(np.random.normal(typeEffects[0], effectSd), 0)
+    else:
+        nrnEffect[neuron] = 0
     for stimulation in [0, 1]:
         samples = np.random.normal(neuronBaselines[neuron] +
-                                   typeEffects[neuronType[neuron]] * stimulation,
+                                   nrnEffect[neuron] * stimulation,
                                    residualSd, nTrials)
         data.extend(zip([neuron] * nTrials,
                         [neuronType[neuron]] * nTrials,
@@ -56,196 +65,203 @@ expData = pd.DataFrame(data, columns=['Neuron', 'Type', 'Trial',
 
 
 ###############
-# 2) PLOT THE RAW DATA
+# 2) DO SIMPLE ANALYSES OF THE DATA
 ###############
 
-# Calculate the mean and standard deviation for each group and condition
-grouped_data = expData.groupby(['Neuron', 'Stim'])
-means = grouped_data['Response'].mean().unstack()
-means['Type'] = neuronType # add the neuron type to the means DataFrame
+# GET NEURON-WISE ANALYSES
+pVals, meanDiff = neuron_specific_analysis_2_cond(expData)
 
-# Set up the plot
-fig, ax = plt.subplots()
+pSignif = pVals < 0.05
+truePos = np.sum(pSignif[neuronType == 0])
+falsePos = np.sum(pSignif[neuronType == 1])
+trueNeg = np.sum(~pSignif[neuronType == 1])
+falseNeg = np.sum(~pSignif[neuronType == 0])
 
-# Plot the means and standard deviations
-for nt in ['C', 'N', 'O']:
-    x = [0, 1]
-    y = means.loc[means['Type'] == nt, [0, 1]].values[0]
-    std = expData.loc[expData['Type'] == nt].groupby('Stim')['Response'].std().values
-    ax.errorbar(x, y, yerr=std, marker='o', linestyle='-', capsize=4, label=f'Neuron Type {nt}')
-    # Join the means of the two conditions with a line
-    ax.plot(x, y, marker='o', linestyle='-', color='black', linewidth=0.5)
+## GET POPULATION-LEVEL PARAMETERS
 
-# Set the labels and title
-ax.set_xlabel('Condition')
-ax.set_ylabel('Response')
-ax.set_title('Mean Response by Condition and Neuron Type')
-# Add a legend
-ax.legend()
-# Show the plot
-plt.show()
+## Wilcoxon signed-rank test across conditions, pairing by neuron
+wilcoxon = stats.wilcoxon(meanDiff)
+pValPopWil = wilcoxon.pvalue
+## Paired t-test across conditions, pairing by neuron
+# compute the mean for each condition for each neuron
+meanCond0 = expData[expData['Stim'] == 0].groupby('Neuron')['Response'].mean()
+meanCond1 = expData[expData['Stim'] == 1].groupby('Neuron')['Response'].mean()
+pairedTtest = stats.ttest_rel(meanCond0, meanCond1)
+pValPopT = pairedTtest.pvalue
+
+# Pop mean
+popEffect = meanDiff.mean()
+popEffectSig = meanDiff[pSignif].mean()
 
 
 ###############
-# 3) FIT MODEL WITH A SINGLE RANDOM EFFECTS DISTRIBUTION
+# 3) FIT A MIXTURE HIERARCHICAL MODEL
 ###############
+
+# Turn Stim and Response into matrices where each row is a neuron
+# and each column is a trial (for each condition)
+stimMatrix = expData.pivot(index='Neuron', columns=['Trial', 'Stim'],
+                            values='Stim').values
+responseMatrix = expData.pivot(index='Neuron', columns=['Trial', 'Stim'],
+                                values='Response').values
 
 # Prepare the data
 stan_data = {
     'nNeurons': nNeurons,
-    'N': nNeurons * nTrials * 2,
-    'Stimulation': expData['Stim'].values,
-    'Response': expData['Response'].values,
-    'neuronId': expData['Neuron'].values + 1,
+    'nObsPerNeuron': nTrials * 2,
+    'Stimulation': stimMatrix,
+    'Response': responseMatrix
 }
 
-# Load model code
-with open('./stan_models/1_spaceless_homogeneous.stan', 'r') as file:
-    model_code = file.read()
-
-# Compile the model
-model = stan.build(program_code=model_code, data=stan_data)
-#httpstan.cache.delete_model_directory(posterior.model_name)
+stan_file = './stan_models/2_spaceless_mixed.stan'
+model = CmdStanModel(stan_file=stan_file)
 
 # Fit the model
-posterior = model.sample(num_chains=3)
+posterior = model.sample(data=stan_data, chains=2, iter_warmup=1500,
+                         iter_sampling=1500, adapt_delta=0.999)
+summary = az.summary(posterior, hdi_prob=0.68)
 
+#print(summary.loc[summary.index.str.startswith('effectPop'), 'mean'])
 
-###############
-# 4) PROCESS MODEL FIT OUTPUT
-###############
+#posteriorVar = model.variational(data=stan_data)
+#print(posteriorVar.variational_params_dict['pMix'])
+#print(posteriorVar.variational_params_dict['effectPop'])
+#print(posteriorVar.variational_params_dict['interceptPop'])
 
-### GET THE NEURON-SPECIFIC PARAMETERS IN A TIDY LONG FORMAT
-# Extract the samples
-fitDf = posterior.to_frame()
-# Get list of columns related to neuronBaseFR
-baseFR_cols = [col for col in fitDf.columns if 'neuronBaseFR' in col]
-# Get list of columns related to neuronEffect
-effect_cols = [col for col in fitDf.columns if 'neuronEffect' in col]
-# Add a 'draws' column using the DataFrame's index
-fitDf['draws'] = fitDf.index
-
-# Melt these columns to long format
-baseFR_df = fitDf.melt(id_vars=['draws'], value_vars=baseFR_cols,
-                    var_name='neuronId', value_name='baseFR')
-effect_df = fitDf.melt(id_vars=['draws'], value_vars=effect_cols,
-                    var_name='neuronId', value_name='stimEffect')
-
-# Extract neuron numbers from the neuronId column
-baseFR_df['neuronId'] = baseFR_df['neuronId'].str.extract('(\d+)').astype(int)
-effect_df['neuronId'] = effect_df['neuronId'].str.extract('(\d+)').astype(int)
-
-# Merge the two datasets
-neuronDf = pd.merge(baseFR_df, effect_df,  how='left',
-                    left_on=['neuronId','draws'], right_on = ['neuronId','draws'])
-
-# Calculate the proportion of positive stimEffect draws for each neuron
-neuronDf['positive'] = neuronDf['stimEffect'] > 0
-propPositive = neuronDf.groupby('neuronId')['positive'].mean()
-
-# Calculate whether this proportion is significantly high
-significant = (propPositive > 0.975).astype(int)
-
-### Compute the neuron-specific means of each parameter
-neuronMeans = neuronDf.groupby('neuronId')[['baseFR', 'stimEffect']].mean().reset_index()
-neuronMeans['propPositive'] = propPositive.values
-neuronMeans['significant'] = significant.values
-# Rename columns for clarity
-neuronMeans.columns = ['neuronId', 'meanBaseFR', 'meanStimEffect', 'propPositive', 'significant']
-# Add neuron type
-neuronMeans['Type'] = neuronType
-
-### GET THE POPULATION PARAMETERS
-# Get the population-level parameters
-
-baselineFR = fitDf['baselineFR'].mean()
-meanEffect = fitDf['meanStimEffect'].mean()
-sigmaEffect = fitDf['sigmaEffect'].mean()
-sigmaBaseline = fitDf['sigmaBaselineFR'].mean()
-sigmaRes = fitDf['sigmaResidual'].mean()
-pValBayes = (fitDf['meanStimEffect'] > 0).mean()
-
-populationDict = {'baselineFR': baselineFR,
-                  'meanEffect': meanEffect,
-                  'sigmaEffect': sigmaEffect,
-                  'sigmaBaseline': sigmaBaseline,
-                  'sigmaRes': sigmaRes,
-                  'pValBayes': pValBayes}
-
-###############
-# 5) DO SIMPLER ANALYSIS
-###############
-
-# Do paired t-test of the Response across conditions, pairing by neuron
-import scipy.stats as stats
-
-# GET NEURON-WISE PARAMETERS
-pVals = np.zeros(nNeurons)
-meanDiff = np.zeros(nNeurons)
-for neuron in range(nNeurons):
-    neuronData = expData.loc[expData['Neuron'] == neuron, ['Stim', 'Response']]
-    # Get p-value for the neuron
-    pairedTtest = stats.ttest_ind(neuronData.loc[(neuronData['Stim'] == 0), 'Response'],
-                                  neuronData.loc[(neuronData['Stim'] == 1), 'Response'])
-    pVals[neuron] = pairedTtest.pvalue
-    # Get mean difference for the neuron
-    meanDiff[neuron] = neuronData.loc[(neuronData['Stim'] == 1), 'Response'].mean() - \
-                neuronData.loc[(neuronData['Stim'] == 0), 'Response'].mean()
-
-neuronMeans['pValTtest'] = pVals
-neuronMeans['naiveEffect'] = meanDiff
-
-# GET POPULATION-LEVEL PARAMETERS
-# Paired t-test across conditions, pairing by neuron
-pairedTtest = stats.ttest_rel(expData.loc[expData['Stim'] == 0, 'Response'],
-                                expData.loc[expData['Stim'] == 1, 'Response'])
-pValPop = pairedTtest.pvalue
-# Wilcoxon signed-rank test across conditions, pairing by neuron
-wilcoxon = stats.wilcoxon(meanDiff)
-# Get the mean difference across conditions
-popDiff = np.mean(meanDiff)
-
-populationDict['pValTtest'] = pValPop
-populationDict['pValWilcoxon'] = wilcoxon.pvalue
-populationDict['popEffectNaive'] = popDiff
 
 
 ###############
-# 5) PLOT MODEL FIT RESULTS
+# 4) COMPARE RESULTS OF THE MODEL TO THE SIMPLE ANALYSES
 ###############
 
-# Plot histogram of meanStimEffect
-fig, ax = plt.subplots()
-sns.histplot(neuronMeans['meanStimEffect'], ax=ax)
-ax.set_title('Histogram of Mean Stimulus Effect')
+### NEURON LEVEL-PARAMETERS
+
+# CLUSTERING OF THE NEURONS
+
+# Get the probability that each neuron has an effect
+pNrn = summary.loc[summary.index.str.startswith('pNrn'), 'mean']
+
+# Compute ROC curve for the model and simple analysis
+fprBay, tprBay, thresholdsBay = roc_curve(1-neuronType, pNrn)
+fpr, tpr, thresholds = roc_curve(1-neuronType, 1-pVals)
+
+# Plot ROC curve
+# concatenate the two pandas dataframes
+rocDf = pd.concat((pd.DataFrame({'fpr': fprBay, 'tpr': tprBay, 'model': 'Model'}),
+  pd.DataFrame({'fpr': fpr, 'tpr': tpr, 'model': 'Simple'})))
+
+(pn.ggplot(rocDf, pn.aes(x='fpr', y='tpr', color='model')) +
+    pn.geom_line() +
+    pn.geom_abline(linetype='dashed') +
+    pn.labs(x='False positive rate', y='True positive rate') +
+    pn.theme_bw())
+
+# Get the true positives, etc, for the model
+plt.hist(pNrn, 30)
 plt.show()
 
-# Plot histogram of meanStimEffect by Type
-fig, ax = plt.subplots()
-sns.histplot(x='meanStimEffect', hue='Type', data=neuronMeans, ax=ax)
-ax.set_title('Histogram of Mean Stimulus Effect by Type')
-plt.show()
+threshold = 0.5
+pSignifBay = pNrn > threshold
+truePosBay = np.sum(pSignifBay[neuronType == 0])
+falsePosBay = np.sum(pSignifBay[neuronType == 1])
+trueNegBay = np.sum(~pSignifBay[neuronType == 1])
+falseNegBay = np.sum(~pSignifBay[neuronType == 0])
 
-# Plot histogram of propPositive by type
-fig, ax = plt.subplots()
-sns.histplot(x='propPositive', hue='Type', data=neuronMeans, ax=ax, bins=10)
-ax.set_title('Histogram of Proportion of Positive Stimulus Effect by Type')
-plt.show()
+results_df = pd.DataFrame({
+    'Metric': ['True Positives', 'False Positives',
+               'True Negatives', 'False Negatives'],
+    'Basic Analysis': [truePos, falsePos, trueNeg, falseNeg],
+    'Model': [truePosBay, falsePosBay, trueNegBay, falseNegBay]
+})
+print(results_df.to_string(index=False))
 
-# First subplot: meanStimEffect vs Type
-sns.scatterplot(x='Type', y='meanStimEffect', data=neuronMeans, ax=axes[0])
-axes[0].set_title('Mean Stimulus Effect by Neuron Type')
 
-# Second subplot: propPositive vs Type
-sns.scatterplot(x='Type', y='propPositive', data=neuronMeans, ax=axes[1])
-axes[1].set_title('Proportion of Positive Stimulus Effect by Neuron Type')
+# EFFECTS OF THE NEURONS
+effectNrnBay = summary.loc[summary.index.str.startswith('effectNrn'),
+                           'mean'].values
+neuronDf = pd.DataFrame({'neuronType': neuronType,
+                         'effectTrue': nrnEffect,
+                         'effectBasic': meanDiff,
+                         'effectModel': effectNrnBay,
+                         'pVal': pVals,
+                         'pModel': pNrn,
+                         'pSignifBasic': pSignif,
+                         'pSignifModel': pSignifBay})
 
-# Third subplot: Bar plot of proportion of 'significant' neurons by Type
-proportion_significant = neuronMeans.groupby('Type')['significant'].mean()
-proportion_significant.plot(kind='bar', ax=axes[2])
-axes[2].set_title('Proportion of Significant Neurons by Type')
+# Plot the estimated effects vs the true effects
+# Filter neuronDf to only show neuronType==0 neurons
+(pn.ggplot(neuronDf[neuronType==0],
+           pn.aes(x='effectTrue', y='effectModel', shape='pSignifModel')) +
+    pn.geom_point(color='k') +
+    pn.geom_point(pn.aes(y='effectBasic', shape='pSignifBasic'), color='r') +
+    pn.geom_abline(linetype='dashed') +
+    pn.labs(x='True effect', y='Estimated effect') +
+    pn.theme_bw())
 
-plt.tight_layout()
-plt.show()
+### POPULATION LEVEL-PARAMETERS
+
+# MIXING PROBABILITIES
+
+# Real mixing probability
+pMixReal = neurons1N/nNeurons
+# Get posterior of pMix from model fit
+pMixPost = posterior.stan_variable(var='pMix')
+pMix = np.mean(pMixPost)
+# Get mean and CI for basic analysis
+pMixBasic = np.mean(pSignif)
+# Get the density of binomial for the basic test
+x = np.arange(0, 1, 0.01)
+pMixBasicDens = stats.binom.pmf(k=np.sum(pSignif), n=nNeurons, p=x)
+pMixBasicDens = pMixBasicDens / np.sum(pMixBasicDens*0.01)
+
+
+vline_data = pd.DataFrame({
+    'xintercept': [pMixReal, pMix, pMixBasic],
+    'color': ['True value', 'Model mean', 'Basic analysis']
+})
+
+(pn.ggplot() +
+ pn.geom_density(pn.aes(x='pMixPost'), color='k') +
+ pn.geom_line(pn.aes(x='x', y='pMixBasicDens'),
+                 data=pd.DataFrame({'x': x, 'pMixBasicDens': pMixBasicDens}),
+                 color='b') +
+ pn.geom_vline(pn.aes(xintercept='xintercept', color='color'), vline_data) +
+ pn.scale_color_manual(values=['b', 'k', 'r']) +
+ pn.labs(x='Mixing probability', color='Legend Title') +
+ pn.theme_bw())
+
+
+# EFFECT SIZE
+
+# Get posterior of effect size from model fit
+effectPost = posterior.stan_variable(var='effectPop')
+effectMean = np.mean(effectPost)
+effectSigmaPost = posterior.stan_variable(var='effectSigma')
+effectSd = np.mean(effectSigmaPost)
+
+# Get mean and CI for basic analysis
+### GET BETTER PDF MAYBE, USING THE LIKELIHOOD OF DIFFERENT
+# MEANS GIVEN THE DATA
+x = np.arange(0, 3, 0.01)
+effectBasic = np.mean(meanDiff[pSignif])
+effectBasicSd = stats.sem(meanDiff[pSignif])
+effectBasicDens = stats.norm.pdf(x, loc=effectBasic, scale=effectBasicSd)
+effectSigmaBasic = np.std(meanDiff[pSignif])
+
+vline_data = pd.DataFrame({
+    'xintercept': [effect, effectMean, effectBasic],
+    'color': ['True value', 'Model mean', 'Basic analysis']
+})
+
+
+(pn.ggplot() +
+ pn.geom_density(pn.aes(x='effectPost'), color='k') +
+ pn.geom_line(pn.aes(x='x', y='effect'),
+                 data=pd.DataFrame({'x': x, 'effect': effectBasicDens}),
+                 color='b') +
+ pn.geom_vline(pn.aes(xintercept='xintercept', color='color'), vline_data) +
+ pn.scale_color_manual(values=['b', 'k', 'r']) +
+ pn.labs(x='Effect size', color='Legend Title') +
+ pn.theme_bw())
 
 
